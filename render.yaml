@@ -82,6 +82,11 @@ services:
       - key: ALUMINIO_JR_ENABLE_SOUL_BOOTSTRAP
         value: "1"
 
+      # Keep /opt/data/.env synchronized with Render's OPENAI_API_KEY.
+      # This removes stale keys saved by the Hermes dashboard after key rotation.
+      - key: ALUMINIO_JR_SYNC_OPENAI_ENV_TO_DISK
+        value: "1"
+
       # Bearer token for the pre-registered Render MCP server. Generate
       # at https://dashboard.render.com/u/*/settings#api-keys and paste
       # into the dashboard's Environment tab. The boot-time patcher

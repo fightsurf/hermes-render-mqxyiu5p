@@ -12,6 +12,40 @@ The Hermes release and the skills commit are both pinned in the `Dockerfile` for
 
 > **Use at your own risk:** The agent can use every Render MCP tool allowed by `RENDER_MCP_API_KEY`, including tools that mutate resources. Lock down dashboard access and use the least-privileged Render account you can.
 
+## Alumínio JR — correção para chave OpenAI antiga
+
+Este fork/patch usa a OpenAI direta por meio do provider `custom` do Hermes:
+
+```yaml
+model:
+  provider: custom
+  default: gpt-4o-mini
+  base_url: https://api.openai.com/v1
+  key_env: OPENAI_API_KEY
+```
+
+Para evitar que uma chave antiga salva pelo dashboard continue em `/opt/data/.env`, o boot sincroniza a chave atual da Render para o disco persistente.
+
+Configuração esperada em Render → Environment:
+
+```text
+OPENAI_API_KEY=<sua chave OpenAI completa>
+ALUMINIO_JR_OPENAI_MODEL=gpt-4o-mini
+ALUMINIO_JR_ENABLE_OPENAI_BOOTSTRAP=1
+ALUMINIO_JR_ENABLE_SOUL_BOOTSTRAP=1
+ALUMINIO_JR_SYNC_OPENAI_ENV_TO_DISK=1
+```
+
+Depois do deploy, confirme no Shell:
+
+```bash
+head -n 8 /opt/data/config.yaml
+grep '^OPENAI_API_KEY=' /opt/data/.env | sed 's/=.*/=***CONFIGURADA***/'
+/opt/hermes/.venv/bin/hermes chat -q "responda apenas ok"
+```
+
+Não abra a aba `MODELS` antes do primeiro teste, porque ela pode sobrescrever o `config.yaml`.
+
 ## Architecture
 
 ```

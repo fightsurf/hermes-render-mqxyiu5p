@@ -67,3 +67,36 @@ fallback_providers: []
 ```
 
 Não use `api_key: ${OPENAI_API_KEY}` neste template. O Hermes pode interpretar isso como texto literal e a OpenAI retorna `invalid_api_key`.
+
+## Patch adicional — chave OpenAI antiga no disco persistente
+
+Este patch também altera `scripts/bootstrap.sh`.
+
+Problema resolvido:
+
+- O Hermes pode manter uma chave antiga em `/opt/data/.env`, salva pelo dashboard.
+- Mesmo após atualizar `OPENAI_API_KEY` na Render, alguns caminhos do Hermes podem continuar lendo a chave antiga do disco.
+- O boot agora trata a variável da Render como fonte de verdade.
+
+Novo comportamento no boot:
+
+1. Se `OPENAI_API_KEY` existir no Environment da Render, o script remove qualquer linha antiga `OPENAI_API_KEY=` de `/opt/data/.env`.
+2. Em seguida grava a chave atual da Render em `/opt/data/.env`.
+3. Não imprime a chave nos logs.
+4. Depois roda `patch-config.py` normalmente.
+
+Variável de controle:
+
+```text
+ALUMINIO_JR_SYNC_OPENAI_ENV_TO_DISK=1
+```
+
+Deixe como `1` para este teste.
+
+Depois do deploy, nos logs deve aparecer:
+
+```text
+[render-tools] synced OPENAI_API_KEY from Render Environment into /opt/data/.env
+```
+
+Se continuar aparecendo erro `Incorrect API key provided ...EZoA`, então a própria variável `OPENAI_API_KEY` da Render ainda está com a chave antiga.
