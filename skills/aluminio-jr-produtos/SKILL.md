@@ -1,7 +1,7 @@
 ---
 name: aluminio-jr-produtos
 description: Use when the user/customer asks about Alumínio JR products, product models, prices, quantities, catalog items, orçamento, valores, tabela, kit, panela, tampa, alça, cabo, válvula, or any product-price question.
-version: 1.0.0
+version: 1.0.1
 author: Alumínio JR / ChatGPT
 license: MIT
 metadata:
@@ -22,11 +22,15 @@ Use this skill whenever the customer asks about:
 - orçamento
 - item específico da Alumínio JR
 
-## Hard rule
+## Hard rules
 
 Never invent product prices.
-
-When the customer asks price/model/product information, consult the Alumínio JR API helper first.
+Always consult the Alumínio JR API helper before answering product/price/model questions.
+If the helper returns `ok: true`, you MUST answer using the returned product/price information.
+If the helper returns `resposta_cliente`, use it as the main final answer.
+Do not say "preciso encaminhar para um atendente" when the helper returned `ok: true`.
+Do not ask for Nome, Cidade, or "já é cliente" just to answer a price question.
+Ask only one question at the end when clarification is needed.
 
 ## Helper command
 
@@ -53,59 +57,63 @@ and calls:
 POST /api/assistente/produtos/consultar
 ```
 
-## Response style
+## How to answer after the helper
 
-After calling the helper, answer short.
+### If helper returns `ok: true`
 
-Use the API field `mensagem_curta` as the main answer.
+Answer with the returned `resposta_cliente` or `mensagem_curta`.
+Keep it short.
+Do not expose JSON.
+Do not request customer registration data.
 
-Do not expose JSON unless the user asks for technical output.
+### If helper returns many options
 
-## Examples
+List up to 3 options with price and ask which one.
 
-Customer:
+Example:
 
-> Quanto custa a panela 4?
+> Encontrei algumas opções:
+> 1. Panela de pressão 4.5L preta com caixa — R$ 36,70
+> 2. Panela de pressão 4.5L preta sem caixa — R$ 35,70
+> Qual dessas?
 
-Action:
+### If helper returns 1 product
 
-```bash
-python3 /opt/render-tools/skills-local/aluminio-jr-produtos/consultar_produto.py --termo "panela 4"
-```
+Answer the product and price.
 
-Answer:
+Example:
 
-> Panela nº 4: R$ 35,00. Qual quantidade?
+> Panela de pressão 4.5L preta com caixa: R$ 36,70. Qual quantidade?
 
-Customer:
+### If quantity was provided
 
-> Quero 10 panelas 4
+Include the total if returned.
 
-Action:
+Example:
 
-```bash
-python3 /opt/render-tools/skills-local/aluminio-jr-produtos/consultar_produto.py --termo "panela 4" --quantidade 10
-```
+> Panela de pressão 4.5L preta com caixa: R$ 36,70. 10 unidade(s): R$ 367,00.
 
-Answer:
-
-> Panela nº 4: R$ 35,00. 10 unidade(s): R$ 350,00.
-
-Customer:
-
-> Tem panela barata?
-
-If the API returns multiple products:
-
-> Encontrei algumas opções. Qual modelo ou tamanho?
-
-## If the API fails
+### If helper returns `ok: false`
 
 Do not guess.
-
 Say:
 
-> Não consegui consultar agora. Vou encaminhar para confirmar.
+> Não encontrei esse produto. Me diga o modelo ou tamanho.
+
+### If the API fails
+
+Do not guess.
+Say:
+
+> Não consegui consultar agora. Vou confirmar.
+
+## Never do this when API returned `ok: true`
+
+Do not answer:
+
+> Consigo registrar seu interesse. Para confirmar preço, preciso encaminhar para um atendente.
+
+That is only allowed when the API/helper failed.
 
 ## Safety
 
