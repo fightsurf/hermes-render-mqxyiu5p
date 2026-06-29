@@ -25,6 +25,8 @@ import subprocess
 import sys
 import threading
 import time
+import select
+import pty
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -33,6 +35,7 @@ HOST = os.environ.get("HERMES_HTTP_BRIDGE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT") or os.environ.get("HERMES_HTTP_BRIDGE_PORT", "10000"))
 TIMEOUT_SECONDS = int(os.environ.get("HERMES_HTTP_BRIDGE_TIMEOUT_SECONDS", "120"))
 MAX_CHARS = int(os.environ.get("HERMES_HTTP_BRIDGE_MAX_CHARS", "4000"))
+USE_PTY = os.environ.get("HERMES_HTTP_BRIDGE_USE_PTY", "1").lower() not in {"0", "false", "no", "off", ""}
 AUTH_KEY = os.environ.get("HERMES_HTTP_BRIDGE_KEY") or os.environ.get("API_SERVER_KEY") or ""
 FALLBACK_TEXT = os.environ.get("HERMES_HTTP_BRIDGE_FALLBACK", "Não consegui consultar agora. Vou confirmar.")
 
@@ -168,6 +171,75 @@ def _clean_cli_output(stdout: str) -> str:
     return "\n".join(useful).strip()
 
 
+def _run_command_with_pty(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str, str]:
+    """Run Hermes under a pseudo-terminal.
+
+    Hermes' one-shot chat can behave differently when stdout/stderr are plain
+    pipes. A PTY mirrors the Render Shell/dashboard path and prevents the CLI
+    from returning only the startup/tools screen.
+    """
+    master_fd, slave_fd = pty.openpty()
+    proc = subprocess.Popen(
+        cmd,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        text=False,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    chunks: list[bytes] = []
+    deadline = time.time() + timeout
+    timed_out = False
+    try:
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                timed_out = True
+                proc.kill()
+                break
+            r, _, _ = select.select([master_fd], [], [], min(0.25, remaining))
+            if r:
+                try:
+                    data = os.read(master_fd, 8192)
+                except OSError:
+                    data = b""
+                if data:
+                    chunks.append(data)
+                elif proc.poll() is not None:
+                    break
+            if proc.poll() is not None:
+                # Drain anything left in the PTY.
+                while True:
+                    r, _, _ = select.select([master_fd], [], [], 0)
+                    if not r:
+                        break
+                    try:
+                        data = os.read(master_fd, 8192)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    chunks.append(data)
+                break
+    finally:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+    try:
+        rc = proc.wait(timeout=2)
+    except Exception:
+        proc.kill()
+        rc = proc.wait()
+    output = b"".join(chunks).decode("utf-8", errors="replace")
+    if timed_out:
+        return 124, output, f"timeout after {timeout}s"
+    return rc, output, ""
+
+
 def _ask_hermes(prompt: str) -> tuple[bool, str, str]:
     if not prompt.strip():
         return False, FALLBACK_TEXT, "empty prompt"
@@ -178,34 +250,46 @@ def _ask_hermes(prompt: str) -> tuple[bool, str, str]:
     started = time.time()
     try:
         with CLI_LOCK:
-            proc = subprocess.run(
-                cmd,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=TIMEOUT_SECONDS,
-                env=env,
-            )
+            if USE_PTY:
+                rc, stdout, stderr = _run_command_with_pty(cmd, env, TIMEOUT_SECONDS)
+            else:
+                proc = subprocess.run(
+                    cmd,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL,
+                    timeout=TIMEOUT_SECONDS,
+                    env=env,
+                )
+                rc, stdout, stderr = proc.returncode, proc.stdout or "", proc.stderr or ""
     except subprocess.TimeoutExpired:
         return False, FALLBACK_TEXT, f"timeout after {TIMEOUT_SECONDS}s"
     except Exception as exc:
         return False, FALLBACK_TEXT, f"exception: {exc}"
 
     elapsed = time.time() - started
-    output = _clean_cli_output(proc.stdout)
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()[-1200:]
-        print(f"[hermes-http-bridge] CLI failed rc={proc.returncode}: {err}", file=sys.stderr, flush=True)
-        return False, output or FALLBACK_TEXT, f"cli rc={proc.returncode}; elapsed={elapsed:.1f}s"
+    output = _clean_cli_output(stdout)
+
+    # Defensive guard: never send Hermes' startup/tool catalog to WhatsApp.
+    # If the CLI only printed the splash screen, treat it as a failed call.
+    if "Available Tools" in output and "Mensagem do cliente" not in output and len(output) > 800:
+        print("[hermes-http-bridge] got Hermes startup screen instead of assistant response", file=sys.stderr, flush=True)
+        return False, FALLBACK_TEXT, f"startup screen; elapsed={elapsed:.1f}s"
+
+    if rc != 0:
+        err = (stderr or stdout or "").strip()[-1200:]
+        print(f"[hermes-http-bridge] CLI failed rc={rc}: {err}", file=sys.stderr, flush=True)
+        return False, output or FALLBACK_TEXT, f"cli rc={rc}; elapsed={elapsed:.1f}s"
     if not output:
-        err = (proc.stderr or "").strip()[-1200:]
+        err = (stderr or "").strip()[-1200:]
         print(f"[hermes-http-bridge] empty output: {err}", file=sys.stderr, flush=True)
         return False, FALLBACK_TEXT, f"empty output; elapsed={elapsed:.1f}s"
-    return True, output, f"elapsed={elapsed:.1f}s"
+    return True, output, f"elapsed={elapsed:.1f}s; pty={USE_PTY}"
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "HermesHTTPBridge/1.0"
+    server_version = "HermesHTTPBridge/1.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[hermes-http-bridge] {self.address_string()} - {fmt % args}", flush=True)
