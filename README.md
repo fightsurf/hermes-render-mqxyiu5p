@@ -353,3 +353,58 @@ What it deliberately doesn't do:
 ## License
 
 This template is MIT licensed (see [`LICENSE`](./LICENSE)). Hermes Agent itself is also MIT licensed; see [the upstream LICENSE](https://github.com/NousResearch/hermes-agent/blob/main/LICENSE).
+
+---
+
+## Alumínio JR quick start
+
+This fork includes a small bootstrap for the Alumínio JR test deployment.
+
+### What this patch does
+
+- Repairs the known-bad Hermes model config values `provider: openai` and `provider: openai-api` into the OpenAI-compatible `custom` provider format.
+- Uses `https://api.openai.com/v1` with `${OPENAI_API_KEY}`.
+- Defaults to `gpt-4o-mini`, controlled by `ALUMINIO_JR_OPENAI_MODEL`.
+- Appends primary customer-service rules to `/opt/data/SOUL.md` once.
+- Adds the `aluminio-jr-atendimento` skill for WhatsApp/customer-service triage.
+
+### Render Environment variables
+
+Set this in **Render → hermes → Environment**:
+
+```text
+OPENAI_API_KEY=<your OpenAI API key>
+```
+
+Optional:
+
+```text
+ALUMINIO_JR_OPENAI_MODEL=gpt-4o-mini
+ALUMINIO_JR_ENABLE_OPENAI_BOOTSTRAP=1
+ALUMINIO_JR_ENABLE_SOUL_BOOTSTRAP=1
+```
+
+Do not set Z-API, database, Firebird, PostgreSQL, or production system tokens during the first test.
+
+### First test
+
+After deploy/restart, use the Hermes dashboard **Chat** tab and send:
+
+```text
+responda apenas ok
+```
+
+If you need to test from Render Shell, use the non-interactive form:
+
+```bash
+/opt/hermes/.venv/bin/hermes chat -q "responda apenas ok"
+```
+
+### First business prompt
+
+After the basic test works, send:
+
+```text
+Você é o assistente de atendimento primário da Alumínio JR. Atenda novos clientes, colete nome, cidade, se já é cliente, interesse, itens e quantidade desejada. Não invente preço, prazo ou estoque. Não feche pedido. Quando precisar, encaminhe para atendimento humano.
+```
+

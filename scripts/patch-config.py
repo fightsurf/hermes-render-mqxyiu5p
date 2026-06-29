@@ -1,36 +1,12 @@
 #!/opt/hermes/.venv/bin/python
 """Idempotent patcher for Hermes' ~/.hermes/config.yaml on Render.
 
-Adds two things the first time it runs against a given config.yaml:
-  1. mcp_servers.render -- HTTP MCP server pointed at mcp.render.com,
-     authenticated via the RENDER_MCP_API_KEY env var. Hermes supports
-     ${VAR} substitution in headers, so the key is resolved lazily at
-     gateway startup. Users can rotate the key in Render's Environment
-     tab without rebuilding the image.
-
-     The Render MCP server is registered without a `tools.include`
-     filter, so Hermes can see every MCP tool the provided API key is
-     allowed to use. Operators should treat this as full Render account
-     access and secure the dashboard/API key accordingly.
-
-  2. skills.external_dirs -- exposes two pre-baked skill bundles to
-     skills_list() and the / slash command surface, without colliding
-     with the upstream skills_sync flow on /opt/data/skills:
-       - /opt/render-tools/skills-local    (Hermes-on-Render overlay)
-       - /opt/render-tools/skills-upstream (pinned render-oss/skills)
-     The local overlay is listed first so its skill names win on collision.
-
-The patcher is INSERT-only by design. If either key already exists
-(even pointing somewhere different), it leaves it alone. This means:
-  - Re-running the patcher on every boot is safe.
-  - Users who edit config.yaml from the dashboard own those edits.
-  - The skill bundle in the image always loads at /opt/render-tools/skills,
-    regardless of whether external_dirs has other entries.
-
-Uses PyYAML, which ships with Hermes' .venv.
+Adds Render MCP tooling, external skill directories, and a conservative
+Aluminio JR bootstrap for OpenAI-based testing.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -44,6 +20,12 @@ RENDER_SKILL_DIRS = (
 )
 RENDER_MCP_URL = "https://mcp.render.com/mcp"
 RENDER_MCP_AUTH = "Bearer ${RENDER_MCP_API_KEY}"
+
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+ALUMINIO_SOUL_MARKER_START = "<!-- ALUMINIO_JR_ASSISTENTE_START -->"
+ALUMINIO_SOUL_MARKER_END = "<!-- ALUMINIO_JR_ASSISTENTE_END -->"
+
 
 def load_config(path: Path) -> dict:
     if not path.exists():
@@ -64,6 +46,11 @@ def load_config(path: Path) -> dict:
         )
         sys.exit(0)
     return data if isinstance(data, dict) else {}
+
+
+def _truthy_env(name: str, default: str = "1") -> bool:
+    value = os.environ.get(name, default).strip().lower()
+    return value not in {"0", "false", "no", "off", ""}
 
 
 def _render_entry() -> dict:
@@ -121,6 +108,114 @@ def ensure_external_skill_dirs(config: dict) -> list[str]:
     return added
 
 
+def _openai_model_config() -> dict:
+    model = os.environ.get("ALUMINIO_JR_OPENAI_MODEL", DEFAULT_OPENAI_MODEL).strip()
+    if not model:
+        model = DEFAULT_OPENAI_MODEL
+    return {
+        "provider": "custom",
+        "default": model,
+        "base_url": OPENAI_BASE_URL,
+        "api_key": "${OPENAI_API_KEY}",
+    }
+
+
+def ensure_openai_custom_model(config: dict) -> bool:
+    """Set a working OpenAI-compatible custom model config for this template.
+
+    Hermes image v2026.5.7 does not accept `provider: openai` or
+    `provider: openai-api` in the gateway runtime used by this Render image.
+    The reliable path for a direct OpenAI key is the OpenAI-compatible
+    `custom` provider pointed at https://api.openai.com/v1.
+
+    This function is intentionally conservative:
+    - It fixes known-broken providers (`openai`, `openai-api`).
+    - It seeds a model block when missing.
+    - It can be forced with ALUMINIO_JR_FORCE_OPENAI_CONFIG=1.
+    - It does not overwrite an already-custom or other explicitly configured
+      provider unless forced.
+    """
+    if not _truthy_env("ALUMINIO_JR_ENABLE_OPENAI_BOOTSTRAP", "1"):
+        return False
+
+    model_cfg = config.get("model")
+    force = _truthy_env("ALUMINIO_JR_FORCE_OPENAI_CONFIG", "0")
+
+    if not isinstance(model_cfg, dict):
+        config["model"] = _openai_model_config()
+        return True
+
+    provider = str(model_cfg.get("provider", "")).strip().lower()
+    default = str(model_cfg.get("default", "")).strip()
+
+    should_fix = force or provider in {"", "openai", "openai-api"}
+    if provider == "custom" and model_cfg.get("base_url") == OPENAI_BASE_URL:
+        # Keep a valid custom OpenAI config. Only fill missing fields.
+        changed = False
+        wanted = _openai_model_config()
+        for key, value in wanted.items():
+            if key not in model_cfg or not str(model_cfg.get(key, "")).strip():
+                model_cfg[key] = value
+                changed = True
+        return changed
+
+    if should_fix:
+        config["model"] = _openai_model_config()
+        return True
+
+    # Do not override Anthropic/OpenRouter/etc. when deliberately selected.
+    return False
+
+
+def ensure_aluminio_jr_soul(data_dir: Path) -> bool:
+    """Append the Alumínio JR operating rules to SOUL.md once."""
+    if not _truthy_env("ALUMINIO_JR_ENABLE_SOUL_BOOTSTRAP", "1"):
+        return False
+
+    soul_path = data_dir / "SOUL.md"
+    existing = ""
+    if soul_path.exists():
+        try:
+            existing = soul_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"[render-tools] cannot read {soul_path}: {exc}", file=sys.stderr)
+            return False
+
+    if ALUMINIO_SOUL_MARKER_START in existing:
+        return False
+
+    section = f"""
+
+{ALUMINIO_SOUL_MARKER_START}
+# Alumínio JR — regras do assistente
+
+Você é o assistente de atendimento primário da Alumínio JR.
+Seu papel inicial é triagem comercial, não fechamento automático de pedido.
+
+Regras obrigatórias:
+- Atenda em português do Brasil, com frases curtas e objetivas.
+- Colete nome, cidade, se já é cliente, interesse, itens e quantidade desejada.
+- Não invente preço, prazo, desconto, estoque, condição de pagamento ou status de pedido.
+- Não confirme pedido, pagamento, carrada, entrega ou crédito sem ferramenta/API autorizada.
+- Quando faltar informação, pergunte apenas o necessário para continuar.
+- Quando houver dúvida comercial, encaminhe para atendimento humano.
+- Para reclamação, urgência, pagamento, alteração de pedido ou cobrança, encaminhe para humano.
+- Antes de qualquer ação que envie mensagem, altere dados ou gere pedido, peça confirmação explícita.
+
+Resposta padrão quando não houver ferramenta de preço conectada:
+"Consigo registrar seu interesse. Para confirmar preço, preciso encaminhar para um atendente."
+{ALUMINIO_SOUL_MARKER_END}
+""".strip()
+
+    new_text = (existing.rstrip() + "\n\n" + section + "\n") if existing.strip() else section + "\n"
+    try:
+        soul_path.write_text(new_text, encoding="utf-8")
+    except OSError as exc:
+        print(f"[render-tools] cannot write {soul_path}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
 def save_config(path: Path, config: dict) -> None:
     text = yaml.safe_dump(
         config,
@@ -142,16 +237,23 @@ def main() -> int:
     config = load_config(path)
     changed_mcp = ensure_render_mcp(config)
     added_dirs = ensure_external_skill_dirs(config)
-    if changed_mcp or added_dirs:
+    changed_model = ensure_openai_custom_model(config)
+    changed_soul = ensure_aluminio_jr_soul(path.parent)
+    if changed_mcp or added_dirs or changed_model:
         save_config(path, config)
         parts = []
         if changed_mcp:
             parts.append("mcp_servers.render")
         for dir_path in added_dirs:
             parts.append(f"skills.external_dirs += {dir_path}")
-        print(f"[render-tools] patched {path}: {', '.join(parts)}")
+        if changed_model:
+            parts.append("model = custom OpenAI-compatible")
+        if parts:
+            print(f"[render-tools] patched {path}: {', '.join(parts)}")
     else:
-        print(f"[render-tools] {path} already has render MCP + skill dirs; nothing to do")
+        print(f"[render-tools] {path} already has render MCP + skill dirs + model; nothing to do")
+    if changed_soul:
+        print(f"[render-tools] appended Alumínio JR rules to {path.parent / 'SOUL.md'}")
     return 0
 
 

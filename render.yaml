@@ -64,6 +64,24 @@ services:
       - key: HERMES_GATEWAY_TOKEN
         generateValue: true
 
+      # Direct OpenAI key for the Alumínio JR test setup. Keep sync:false so
+      # the secret is entered in the Render dashboard and never committed.
+      - key: OPENAI_API_KEY
+        sync: false
+
+      # Default model used by scripts/patch-config.py when it repairs a bad
+      # upstream OpenAI provider setting into the custom OpenAI-compatible
+      # provider format. You can change this later in the Render Environment.
+      - key: ALUMINIO_JR_OPENAI_MODEL
+        value: "gpt-4o-mini"
+
+      # Set to "0" if you do not want the boot patcher to repair OpenAI model
+      # config or append the Alumínio JR rules to SOUL.md.
+      - key: ALUMINIO_JR_ENABLE_OPENAI_BOOTSTRAP
+        value: "1"
+      - key: ALUMINIO_JR_ENABLE_SOUL_BOOTSTRAP
+        value: "1"
+
       # Bearer token for the pre-registered Render MCP server. Generate
       # at https://dashboard.render.com/u/*/settings#api-keys and paste
       # into the dashboard's Environment tab. The boot-time patcher
