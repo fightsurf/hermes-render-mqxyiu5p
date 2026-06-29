@@ -5,8 +5,9 @@ Arquivos alterados/adicionados:
 - `scripts/patch-config.py`
   - Corrige `provider: openai` e `provider: openai-api` para `provider: custom`.
   - Configura `base_url: https://api.openai.com/v1`.
-  - Usa `api_key: ${OPENAI_API_KEY}`.
+  - Usa `key_env: OPENAI_API_KEY` para o Hermes buscar a chave no Environment da Render.
   - Usa modelo padrão `gpt-4o-mini`, ou o valor de `ALUMINIO_JR_OPENAI_MODEL`.
+  - Remove a forma antiga `api_key: ${OPENAI_API_KEY}` quando ela existir no `config.yaml`.
   - Adiciona regras da Alumínio JR em `/opt/data/SOUL.md` uma única vez.
 
 - `skills/aluminio-jr-atendimento/SKILL.md`
@@ -49,3 +50,20 @@ Se quiser testar pelo Shell da Render:
 
 Não coloque ainda Z-API, banco, Firebird, PostgreSQL ou tokens do sistema Alumínio JR.
 Primeiro confirme que o Hermes responde usando a chave OpenAI.
+
+
+## Bloco esperado no config.yaml
+
+Após o deploy/restart, o início de `/opt/data/config.yaml` deve ficar assim:
+
+```yaml
+model:
+  provider: custom
+  default: gpt-4o-mini
+  base_url: https://api.openai.com/v1
+  key_env: OPENAI_API_KEY
+providers: {}
+fallback_providers: []
+```
+
+Não use `api_key: ${OPENAI_API_KEY}` neste template. O Hermes pode interpretar isso como texto literal e a OpenAI retorna `invalid_api_key`.

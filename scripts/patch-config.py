@@ -116,7 +116,10 @@ def _openai_model_config() -> dict:
         "provider": "custom",
         "default": model,
         "base_url": OPENAI_BASE_URL,
-        "api_key": "${OPENAI_API_KEY}",
+        # Hermes custom providers expect the env var name here.
+        # Do not use api_key: ${OPENAI_API_KEY}; some builds treat that
+        # as a literal key value and OpenAI rejects it as invalid_api_key.
+        "key_env": "OPENAI_API_KEY",
     }
 
 
@@ -151,7 +154,12 @@ def ensure_openai_custom_model(config: dict) -> bool:
     should_fix = force or provider in {"", "openai", "openai-api"}
     if provider == "custom" and model_cfg.get("base_url") == OPENAI_BASE_URL:
         # Keep a valid custom OpenAI config. Only fill missing fields.
+        # Also remove the old api_key form so the runtime cannot prefer a
+        # literal ${OPENAI_API_KEY} value over key_env.
         changed = False
+        if "api_key" in model_cfg:
+            model_cfg.pop("api_key", None)
+            changed = True
         wanted = _openai_model_config()
         for key, value in wanted.items():
             if key not in model_cfg or not str(model_cfg.get(key, "")).strip():

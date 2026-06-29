@@ -25,3 +25,31 @@ class PatchConfigTests(unittest.TestCase):
         render_entry = patch_config._render_entry()
 
         self.assertNotIn("tools", render_entry)
+
+    def test_openai_model_config_uses_key_env(self):
+        patch_config = load_patch_config()
+
+        model = patch_config._openai_model_config()
+
+        self.assertEqual(model["provider"], "custom")
+        self.assertEqual(model["base_url"], "https://api.openai.com/v1")
+        self.assertEqual(model["key_env"], "OPENAI_API_KEY")
+        self.assertNotIn("api_key", model)
+
+    def test_existing_custom_config_replaces_literal_api_key_with_key_env(self):
+        patch_config = load_patch_config()
+        config = {
+            "model": {
+                "provider": "custom",
+                "default": "gpt-4o-mini",
+                "base_url": "https://api.openai.com/v1",
+                "api_key": "${OPENAI_API_KEY}",
+            }
+        }
+
+        changed = patch_config.ensure_openai_custom_model(config)
+
+        self.assertTrue(changed)
+        self.assertNotIn("api_key", config["model"])
+        self.assertEqual(config["model"]["key_env"], "OPENAI_API_KEY")
+

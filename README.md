@@ -363,7 +363,7 @@ This fork includes a small bootstrap for the Alumínio JR test deployment.
 ### What this patch does
 
 - Repairs the known-bad Hermes model config values `provider: openai` and `provider: openai-api` into the OpenAI-compatible `custom` provider format.
-- Uses `https://api.openai.com/v1` with `${OPENAI_API_KEY}`.
+- Uses `https://api.openai.com/v1` with `key_env: OPENAI_API_KEY`.
 - Defaults to `gpt-4o-mini`, controlled by `ALUMINIO_JR_OPENAI_MODEL`.
 - Appends primary customer-service rules to `/opt/data/SOUL.md` once.
 - Adds the `aluminio-jr-atendimento` skill for WhatsApp/customer-service triage.
@@ -373,7 +373,7 @@ This fork includes a small bootstrap for the Alumínio JR test deployment.
 Set this in **Render → hermes → Environment**:
 
 ```text
-OPENAI_API_KEY=<your OpenAI API key>
+OPENAI_API_KEY=<sua chave completa da OpenAI API>
 ```
 
 Optional:
@@ -385,6 +385,19 @@ ALUMINIO_JR_ENABLE_SOUL_BOOTSTRAP=1
 ```
 
 Do not set Z-API, database, Firebird, PostgreSQL, or production system tokens during the first test.
+
+Expected model block after boot:
+
+```yaml
+model:
+  provider: custom
+  default: gpt-4o-mini
+  base_url: https://api.openai.com/v1
+  key_env: OPENAI_API_KEY
+```
+
+Do not use `api_key: ${OPENAI_API_KEY}` in this template. In the current hosted Hermes runtime, that form can be treated as a literal value instead of reading the Render environment variable.
+
 
 ### First test
 
