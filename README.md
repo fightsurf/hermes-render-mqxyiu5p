@@ -455,3 +455,28 @@ After the basic test works, send:
 Você é o assistente de atendimento primário da Alumínio JR. Atenda novos clientes, colete nome, cidade, se já é cliente, interesse, itens e quantidade desejada. Não invente preço, prazo ou estoque. Não feche pedido. Quando precisar, encaminhe para atendimento humano.
 ```
 
+
+## Alumínio JR: consulta segura de produtos
+
+Este fork inclui uma skill `aluminio-jr-produtos` para consultar a API segura do sistema Alumínio JR.
+
+Configure no serviço Hermes, em Environment:
+
+```text
+ALUMINIO_JR_API_BASE_URL=https://catalogo-aluminio-jr.onrender.com
+ASSISTENTE_API_TOKEN=<mesmo token configurado no sistema Alumínio JR>
+```
+
+Teste no Shell da Render:
+
+```bash
+python3 /opt/render-tools/skills-local/aluminio-jr-produtos/consultar_produto.py --termo "panela 4"
+```
+
+Depois teste no Hermes:
+
+```bash
+/opt/hermes/.venv/bin/hermes chat -q "Quanto custa a panela 4?"
+```
+
+Regra: o Hermes não deve inventar preços. Ele deve responder usando apenas os dados retornados pela API.

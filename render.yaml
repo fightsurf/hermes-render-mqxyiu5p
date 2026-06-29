@@ -87,6 +87,16 @@ services:
       - key: ALUMINIO_JR_SYNC_OPENAI_ENV_TO_DISK
         value: "1"
 
+      # Base URL of the Alumínio JR production system. Hermes uses this
+      # to call read-only assistant APIs, such as product/price lookup.
+      - key: ALUMINIO_JR_API_BASE_URL
+        value: "https://catalogo-aluminio-jr.onrender.com"
+
+      # Bearer token used by Hermes to call /api/assistente/* routes in
+      # the Alumínio JR system. Set the same secret in both projects.
+      - key: ASSISTENTE_API_TOKEN
+        sync: false
+
       # Bearer token for the pre-registered Render MCP server. Generate
       # at https://dashboard.render.com/u/*/settings#api-keys and paste
       # into the dashboard's Environment tab. The boot-time patcher
