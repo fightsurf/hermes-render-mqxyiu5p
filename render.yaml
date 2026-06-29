@@ -58,6 +58,18 @@ services:
       - key: HERMES_DASHBOARD_TUI
         value: "1"
 
+      # Alumínio JR HTTP bridge for n8n/Z-API. When enabled, the public
+      # Render URL serves POST /chat and POST /v1/chat/completions by
+      # invoking `hermes chat -q` internally. This is simpler and more
+      # reliable for the WhatsApp MVP than depending on the upstream
+      # OpenAI-compatible API server route.
+      - key: HERMES_HTTP_BRIDGE_ENABLED
+        value: "1"
+      - key: HERMES_HTTP_BRIDGE_KEY
+        sync: false
+      - key: HERMES_HTTP_BRIDGE_TIMEOUT_SECONDS
+        value: "120"
+
       # Generated once at first deploy. Reuse this value as API_SERVER_KEY
       # in the dashboard if you later opt into the OpenAI-compatible API
       # server (API_SERVER_ENABLED=true).
