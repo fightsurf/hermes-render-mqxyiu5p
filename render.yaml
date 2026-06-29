@@ -87,6 +87,7 @@ services:
       - key: ALUMINIO_JR_SYNC_OPENAI_ENV_TO_DISK
         value: "1"
 
+
       # Base URL of the Alumínio JR production system. Hermes uses this
       # to call read-only assistant APIs, such as product/price lookup.
       - key: ALUMINIO_JR_API_BASE_URL
