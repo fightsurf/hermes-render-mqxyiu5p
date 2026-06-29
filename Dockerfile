@@ -58,7 +58,8 @@ COPY --chown=hermes:hermes skills/ /opt/render-tools/skills-local/
 # the upstream entrypoint chain (tini → docker/entrypoint.sh).
 COPY --chown=root:root scripts/bootstrap.sh /opt/render-tools/bootstrap.sh
 COPY --chown=root:root scripts/patch-config.py /opt/render-tools/patch-config.py
-RUN chmod 0755 /opt/render-tools/bootstrap.sh /opt/render-tools/patch-config.py
+COPY --chown=root:root scripts/hermes_http_bridge.py /opt/render-tools/hermes_http_bridge.py
+RUN chmod 0755 /opt/render-tools/bootstrap.sh /opt/render-tools/patch-config.py /opt/render-tools/hermes_http_bridge.py
 
 # Pre-create the dir the patcher writes to so chown works cleanly on
 # first boot. The mounted disk replaces this empty dir at runtime;

@@ -88,6 +88,21 @@ else
   echo "[render-tools] warning: ${PATCHER} not found or not executable; skipping" >&2
 fi
 
+# Optional Alumínio JR HTTP bridge mode. This is intentionally separate from
+# the upstream OpenAI-compatible API server because some hosted deployments
+# expose the dashboard/gateway but not /v1/chat/completions. In bridge mode,
+# the public Render URL serves a tiny authenticated HTTP API that calls the
+# Hermes CLI one request at a time.
+if truthy "${HERMES_HTTP_BRIDGE_ENABLED:-0}"; then
+  BRIDGE="/opt/render-tools/hermes_http_bridge.py"
+  if [ ! -x "${BRIDGE}" ]; then
+    echo "[render-tools] error: ${BRIDGE} not found or not executable" >&2
+    exit 1
+  fi
+  echo "[render-tools] starting Alumínio JR Hermes HTTP bridge"
+  exec gosu hermes /opt/hermes/.venv/bin/python "${BRIDGE}"
+fi
+
 # Hand off to the upstream entrypoint. The upstream script handles
 # privilege drop, dashboard backgrounding, and the actual gateway exec.
 exec /opt/hermes/docker/entrypoint.sh "$@"
