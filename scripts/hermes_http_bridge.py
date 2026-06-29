@@ -1,20 +1,19 @@
 #!/opt/hermes/.venv/bin/python
-"""HTTP bridge for n8n/Z-API -> Hermes CLI.
+"""HTTP bridge for n8n/Z-API -> Alumínio JR assistant on Render.
 
-Small, dependency-free server used by Alumínio JR to call Hermes from n8n.
-It deliberately avoids the upstream dashboard/API-server routing confusion and
-exposes two POST endpoints on the Render public port:
+This bridge is intentionally simple and stable for WhatsApp testing.
+It exposes:
 
+- GET  /healthz
+- GET  /api/status
 - POST /chat
-  Body: {"mensagem":"Bom dia", "telefone":"5583..."}
-  Response: {"ok": true, "resposta": "..."}
-
-- POST /v1/chat/completions
-  Minimal OpenAI-compatible wrapper for n8n HTTP nodes.
+- POST /v1/chat/completions  (minimal compatibility wrapper)
 
 Authentication: Authorization: Bearer <HERMES_HTTP_BRIDGE_KEY>
-Fallback: API_SERVER_KEY is accepted as the same secret if the bridge-specific
-key is not set.
+
+Default engine is "direct": deterministic replies + Alumínio JR product API +
+OpenAI fallback. The old Hermes CLI path can still be enabled with:
+HERMES_HTTP_BRIDGE_ENGINE=cli
 """
 from __future__ import annotations
 
@@ -25,25 +24,37 @@ import subprocess
 import sys
 import threading
 import time
-import select
-import pty
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-HERMES_BIN = os.environ.get("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
 HOST = os.environ.get("HERMES_HTTP_BRIDGE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT") or os.environ.get("HERMES_HTTP_BRIDGE_PORT", "10000"))
+AUTH_KEY = os.environ.get("HERMES_HTTP_BRIDGE_KEY") or os.environ.get("API_SERVER_KEY") or ""
+ENGINE = os.environ.get("HERMES_HTTP_BRIDGE_ENGINE", "direct").strip().lower()
 TIMEOUT_SECONDS = int(os.environ.get("HERMES_HTTP_BRIDGE_TIMEOUT_SECONDS", "120"))
 MAX_CHARS = int(os.environ.get("HERMES_HTTP_BRIDGE_MAX_CHARS", "4000"))
-USE_PTY = os.environ.get("HERMES_HTTP_BRIDGE_USE_PTY", "1").lower() not in {"0", "false", "no", "off", ""}
-AUTH_KEY = os.environ.get("HERMES_HTTP_BRIDGE_KEY") or os.environ.get("API_SERVER_KEY") or ""
 FALLBACK_TEXT = os.environ.get("HERMES_HTTP_BRIDGE_FALLBACK", "Não consegui consultar agora. Vou confirmar.")
+HERMES_BIN = os.environ.get("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
+OPENAI_MODEL = os.environ.get("ALUMINIO_JR_OPENAI_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-5-mini"
+OPENAI_BASE_URL = (os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+ALUMINIO_BASE_URL = (os.environ.get("ALUMINIO_JR_API_BASE_URL") or "").rstrip("/")
+ASSISTENTE_API_TOKEN = os.environ.get("ASSISTENTE_API_TOKEN") or ""
 
-# Serializes CLI calls. The Hermes CLI/session/log files are safer with one
-# request at a time during the MVP.
 CLI_LOCK = threading.Lock()
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-BOX_CHARS = "─━│┃┊┆┌┐└┘├┤┬┴┼╭╮╰╯═║"
+
+PRODUTO_RE = re.compile(
+    r"\b(pre[cç]o|valor|custa|quanto|or[cç]amento|tabela|produto|panela|tampa|cabo|al[cç]a|v[áa]lvula|kit|caixa)\b",
+    re.IGNORECASE,
+)
+SAUDACOES = [
+    (re.compile(r"^\s*bom\s+dia[!.\s]*$", re.IGNORECASE), "Bom dia. Em que posso te ajudar?"),
+    (re.compile(r"^\s*boa\s+tarde[!.\s]*$", re.IGNORECASE), "Boa tarde. Em que posso te ajudar?"),
+    (re.compile(r"^\s*boa\s+noite[!.\s]*$", re.IGNORECASE), "Boa noite. Em que posso te ajudar?"),
+    (re.compile(r"^\s*(oi|ol[áa]|opa)[!.\s]*$", re.IGNORECASE), "Olá. Em que posso te ajudar?"),
+]
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, data: dict[str, Any]) -> None:
@@ -68,7 +79,6 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
 
 def _authorized(handler: BaseHTTPRequestHandler) -> bool:
     if not AUTH_KEY:
-        # Refuse to expose the bridge publicly without a key.
         return False
     auth = handler.headers.get("Authorization") or ""
     return auth.strip() == f"Bearer {AUTH_KEY}"
@@ -86,217 +96,265 @@ def _extract_prompt_from_openai(body: dict[str, Any]) -> str:
             if isinstance(content, list):
                 parts: list[str] = []
                 for part in content:
-                    if isinstance(part, dict):
-                        text = part.get("text")
-                        if isinstance(text, str):
-                            parts.append(text)
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        parts.append(part["text"])
                 return "\n".join(parts).strip()
     return ""
 
 
-def _build_whatsapp_prompt(mensagem: str, telefone: str = "", nome: str = "") -> str:
-    mensagem = (mensagem or "").strip()
-    telefone = (telefone or "").strip()
-    nome = (nome or "").strip()
-    context_bits = []
-    if telefone:
-        context_bits.append(f"Telefone/identificador do WhatsApp: {telefone}")
-    if nome:
-        context_bits.append(f"Nome exibido no WhatsApp: {nome}")
-    context = "\n".join(context_bits)
-    return (
-        "Você está respondendo um cliente da Alumínio JR pelo WhatsApp.\n"
-        "Responda em português do Brasil, de forma curta, direta e natural.\n"
-        "Se precisar consultar preço/produto, use as ferramentas/skills disponíveis.\n"
-        "Não peça nome ou cidade no início se a pergunta for simples.\n"
-        "\n"
-        f"{context}\n"
-        "Mensagem do cliente:\n"
-        f"{mensagem}"
-    ).strip()
+def _extract_quantidade(texto: str) -> int | None:
+    texto = texto or ""
+    patterns = [
+        r"\b(?:quero|preciso|comprar|mande|manda|me\s+v[êe]|orc?amento\s+de|or[cç]amento\s+de)\s+(\d{1,5})\b",
+        r"\b(\d{1,5})\s*(?:un|unid|unidade|unidades|pe[cç]as|panelas|tampas|kits)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, texto, flags=re.IGNORECASE)
+        if m:
+            try:
+                qtd = int(m.group(1))
+                if 0 < qtd <= 100000:
+                    return qtd
+            except Exception:
+                pass
+    return None
+
+
+def _is_product_question(texto: str) -> bool:
+    return bool(PRODUTO_RE.search(texto or ""))
+
+
+def _product_api(texto: str) -> tuple[bool, str, str]:
+    if not ALUMINIO_BASE_URL or not ASSISTENTE_API_TOKEN:
+        return False, FALLBACK_TEXT, "product api env missing"
+    payload: dict[str, Any] = {"termo": (texto or "").strip()[:300]}
+    qtd = _extract_quantidade(texto)
+    if qtd is not None:
+        payload["quantidade"] = qtd
+
+    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{ALUMINIO_BASE_URL}/api/assistente/produtos/consultar",
+        data=raw,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {ASSISTENTE_API_TOKEN}",
+            "User-Agent": "hermes-http-bridge-aluminio-jr/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[-500:]
+        return False, FALLBACK_TEXT, f"product api http {exc.code}: {detail}"
+    except Exception as exc:
+        return False, FALLBACK_TEXT, f"product api error: {exc}"
+
+    # Prefer the helper-enriched answer when present; otherwise use mensagem_curta.
+    resposta = (data.get("resposta_cliente") or data.get("mensagem_curta") or "").strip()
+    if not resposta:
+        produtos = data.get("produtos")
+        if isinstance(produtos, list) and produtos:
+            linhas = []
+            for i, produto in enumerate(produtos[:3], start=1):
+                if not isinstance(produto, dict):
+                    continue
+                nome = produto.get("nome") or "Produto"
+                preco = produto.get("precoFormatado") or ""
+                total = produto.get("totalFormatado") or ""
+                extra = f" — {preco}" if preco else ""
+                if qtd is not None and total:
+                    extra += f" | {qtd} un.: {total}"
+                linhas.append(f"{i}. {nome}{extra}")
+            if len(linhas) == 1:
+                resposta = linhas[0].split(". ", 1)[1] + ". Qual quantidade?"
+            elif linhas:
+                resposta = "Encontrei essas opções:\n" + "\n".join(linhas) + "\nQual dessas?"
+    if not resposta:
+        resposta = "Não encontrei esse produto. Me diga o modelo ou tamanho."
+    return bool(data.get("ok", True)), resposta, "product api"
+
+
+def _openai_extract_text(data: dict[str, Any]) -> str:
+    if isinstance(data.get("output_text"), str) and data["output_text"].strip():
+        return data["output_text"].strip()
+    output = data.get("output")
+    if isinstance(output, list):
+        parts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        text = part.get("text") or part.get("output_text")
+                        if isinstance(text, str):
+                            parts.append(text)
+        if parts:
+            return "\n".join(parts).strip()
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+            return msg["content"].strip()
+    return ""
+
+
+def _openai_call(texto: str, telefone: str = "", nome: str = "") -> tuple[bool, str, str]:
+    api_key = os.environ.get("OPENAI_API_KEY") or ""
+    if not api_key:
+        return False, FALLBACK_TEXT, "OPENAI_API_KEY missing"
+
+    system = (
+        "Você é o assistente de atendimento da Alumínio JR no WhatsApp. "
+        "Responda em português do Brasil, de forma curta, direta e natural. "
+        "Use no máximo 2 frases. Faça no máximo 1 pergunta. "
+        "Não peça nome no começo. Não use 'O que você precisa?'. "
+        "Prefira 'Em que posso te ajudar?'. "
+        "Não invente preço, prazo, estoque, pagamento, pedido ou desconto. "
+        "Se não souber algo do sistema, diga: 'Vou confirmar.'"
+    )
+    user = (texto or "").strip()[:MAX_CHARS]
+
+    # Try Responses API first.
+    responses_payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_output_tokens": 180,
+    }
+    try:
+        req = urllib.request.Request(
+            f"{OPENAI_BASE_URL}/responses",
+            data=json.dumps(responses_payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        text = _openai_extract_text(data)
+        if text:
+            return True, text, "openai responses"
+    except Exception as exc:
+        first_error = str(exc)
+
+    # Fallback to Chat Completions for models/accounts that still support it.
+    chat_payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_completion_tokens": 180,
+    }
+    try:
+        req = urllib.request.Request(
+            f"{OPENAI_BASE_URL}/chat/completions",
+            data=json.dumps(chat_payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        text = _openai_extract_text(data)
+        if text:
+            return True, text, "openai chat.completions"
+    except Exception as exc:
+        return False, FALLBACK_TEXT, f"openai error: responses={first_error}; chat={exc}"
+
+    return False, FALLBACK_TEXT, "openai empty output"
 
 
 def _clean_cli_output(stdout: str) -> str:
     text = ANSI_RE.sub("", stdout or "")
-    lines = text.splitlines()
-
-    # Prefer the assistant panel if the TUI-like output is present.
-    in_panel = False
-    panel_lines: list[str] = []
-    for raw in lines:
-        line = raw.rstrip()
-        if "⚕ Hermes" in line or " Hermes " in line and any(ch in line for ch in "─━"):
-            in_panel = True
-            continue
-        if in_panel:
-            stripped = line.strip()
-            if stripped.startswith("Resume this session") or stripped.startswith("Session:"):
-                break
-            # Stop at a pure divider after we already collected text.
-            no_spaces = stripped.replace(" ", "")
-            if panel_lines and no_spaces and all(ch in BOX_CHARS for ch in no_spaces):
-                break
-            cleaned = stripped.strip(BOX_CHARS).strip()
-            if cleaned and not cleaned.startswith("📚 skill") and "skill" not in cleaned.lower():
-                panel_lines.append(cleaned)
-
-    candidate = "\n".join(panel_lines).strip()
-    if candidate:
-        return candidate
-
-    # Fallback: remove common metadata/noise and return useful remaining text.
+    lines = [ln.strip() for ln in text.splitlines()]
     useful: list[str] = []
-    skip_prefixes = (
-        "Query:",
-        "Initializing agent",
-        "Resume this session",
-        "Session:",
-        "Duration:",
-        "Messages:",
-        "root@",
-    )
-    for raw in lines:
-        stripped = raw.strip()
-        if not stripped:
+    for line in lines:
+        if not line:
             continue
-        if any(stripped.startswith(prefix) for prefix in skip_prefixes):
+        if line.startswith(("Query:", "Initializing agent", "Resume this session", "Session:", "Duration:", "Messages:")):
             continue
-        if stripped.replace(" ", "") and all(ch in BOX_CHARS for ch in stripped.replace(" ", "")):
+        if "Available Tools" in line or "MCP Servers" in line:
             continue
-        if "📚 skill" in stripped:
-            continue
-        cleaned = stripped.strip(BOX_CHARS).strip()
-        if cleaned:
-            useful.append(cleaned)
+        useful.append(line)
     return "\n".join(useful).strip()
 
 
-def _run_command_with_pty(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, str, str]:
-    """Run Hermes under a pseudo-terminal.
-
-    Hermes' one-shot chat can behave differently when stdout/stderr are plain
-    pipes. A PTY mirrors the Render Shell/dashboard path and prevents the CLI
-    from returning only the startup/tools screen.
-    """
-    master_fd, slave_fd = pty.openpty()
-    proc = subprocess.Popen(
-        cmd,
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        env=env,
-        text=False,
-        close_fds=True,
-    )
-    os.close(slave_fd)
-    chunks: list[bytes] = []
-    deadline = time.time() + timeout
-    timed_out = False
-    try:
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                timed_out = True
-                proc.kill()
-                break
-            r, _, _ = select.select([master_fd], [], [], min(0.25, remaining))
-            if r:
-                try:
-                    data = os.read(master_fd, 8192)
-                except OSError:
-                    data = b""
-                if data:
-                    chunks.append(data)
-                elif proc.poll() is not None:
-                    break
-            if proc.poll() is not None:
-                # Drain anything left in the PTY.
-                while True:
-                    r, _, _ = select.select([master_fd], [], [], 0)
-                    if not r:
-                        break
-                    try:
-                        data = os.read(master_fd, 8192)
-                    except OSError:
-                        break
-                    if not data:
-                        break
-                    chunks.append(data)
-                break
-    finally:
-        try:
-            os.close(master_fd)
-        except OSError:
-            pass
-
-    try:
-        rc = proc.wait(timeout=2)
-    except Exception:
-        proc.kill()
-        rc = proc.wait()
-    output = b"".join(chunks).decode("utf-8", errors="replace")
-    if timed_out:
-        return 124, output, f"timeout after {timeout}s"
-    return rc, output, ""
-
-
-def _ask_hermes(prompt: str) -> tuple[bool, str, str]:
-    if not prompt.strip():
-        return False, FALLBACK_TEXT, "empty prompt"
-    prompt = prompt[:MAX_CHARS]
+def _cli_call(texto: str, telefone: str = "", nome: str = "") -> tuple[bool, str, str]:
+    prompt = (
+        "Você está respondendo um cliente da Alumínio JR pelo WhatsApp. "
+        "Responda curto e direto.\n\n"
+        f"Telefone: {telefone}\n"
+        f"Mensagem do cliente: {texto}"
+    )[:MAX_CHARS]
     cmd = [HERMES_BIN, "chat", "-q", prompt]
     env = os.environ.copy()
     env.setdefault("HERMES_HOME", "/opt/data")
     started = time.time()
     try:
         with CLI_LOCK:
-            if USE_PTY:
-                rc, stdout, stderr = _run_command_with_pty(cmd, env, TIMEOUT_SECONDS)
-            else:
-                proc = subprocess.run(
-                    cmd,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    stdin=subprocess.DEVNULL,
-                    timeout=TIMEOUT_SECONDS,
-                    env=env,
-                )
-                rc, stdout, stderr = proc.returncode, proc.stdout or "", proc.stderr or ""
+            proc = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                timeout=TIMEOUT_SECONDS,
+                env=env,
+            )
     except subprocess.TimeoutExpired:
-        return False, FALLBACK_TEXT, f"timeout after {TIMEOUT_SECONDS}s"
+        return False, FALLBACK_TEXT, f"cli timeout after {TIMEOUT_SECONDS}s"
     except Exception as exc:
-        return False, FALLBACK_TEXT, f"exception: {exc}"
-
+        return False, FALLBACK_TEXT, f"cli exception: {exc}"
+    out = _clean_cli_output(proc.stdout or "")
     elapsed = time.time() - started
-    output = _clean_cli_output(stdout)
+    if proc.returncode != 0:
+        return False, out or FALLBACK_TEXT, f"cli rc={proc.returncode}; elapsed={elapsed:.1f}s"
+    if not out or ("Available Tools" in out and len(out) > 800):
+        return False, FALLBACK_TEXT, f"cli startup/empty; elapsed={elapsed:.1f}s"
+    return True, out, f"cli elapsed={elapsed:.1f}s"
 
-    # Defensive guard: never send Hermes' startup/tool catalog to WhatsApp.
-    # If the CLI only printed the splash screen, treat it as a failed call.
-    if "Available Tools" in output and "Mensagem do cliente" not in output and len(output) > 800:
-        print("[hermes-http-bridge] got Hermes startup screen instead of assistant response", file=sys.stderr, flush=True)
-        return False, FALLBACK_TEXT, f"startup screen; elapsed={elapsed:.1f}s"
 
-    if rc != 0:
-        err = (stderr or stdout or "").strip()[-1200:]
-        print(f"[hermes-http-bridge] CLI failed rc={rc}: {err}", file=sys.stderr, flush=True)
-        return False, output or FALLBACK_TEXT, f"cli rc={rc}; elapsed={elapsed:.1f}s"
-    if not output:
-        err = (stderr or "").strip()[-1200:]
-        print(f"[hermes-http-bridge] empty output: {err}", file=sys.stderr, flush=True)
-        return False, FALLBACK_TEXT, f"empty output; elapsed={elapsed:.1f}s"
-    return True, output, f"elapsed={elapsed:.1f}s; pty={USE_PTY}"
+def _answer(texto: str, telefone: str = "", nome: str = "") -> tuple[bool, str, str]:
+    texto = (texto or "").strip()
+    if not texto:
+        return False, FALLBACK_TEXT, "empty message"
+
+    if ENGINE == "cli":
+        return _cli_call(texto, telefone, nome)
+
+    # Fast deterministic WhatsApp greetings. This prevents LLM/tool splash noise.
+    for regex, resposta in SAUDACOES:
+        if regex.match(texto):
+            return True, resposta, "direct greeting"
+
+    # Product/price questions use the already-secured Alumínio JR product API.
+    if _is_product_question(texto):
+        ok, resposta, detail = _product_api(texto)
+        return ok, resposta, detail
+
+    # General short customer-service answer.
+    return _openai_call(texto, telefone, nome)
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "HermesHTTPBridge/1.1"
+    server_version = "HermesHTTPBridge/2.0"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[hermes-http-bridge] {self.address_string()} - {fmt % args}", flush=True)
 
+    def do_HEAD(self) -> None:  # noqa: N802
+        self.send_response(200)
+        self.end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path in {"/", "/healthz", "/api/status"}:
-            _json_response(self, 200, {"ok": True, "service": "hermes-http-bridge"})
+            _json_response(self, 200, {"ok": True, "service": "hermes-http-bridge", "engine": ENGINE})
             return
         _json_response(self, 404, {"ok": False, "error": "not found"})
 
@@ -318,8 +376,9 @@ class Handler(BaseHTTPRequestHandler):
             telefone = str(body.get("telefone") or body.get("phone") or body.get("identificador") or "")
             nome = str(body.get("nome") or body.get("name") or "")
 
-        prompt = _build_whatsapp_prompt(mensagem, telefone=telefone, nome=nome)
-        ok, resposta, detail = _ask_hermes(prompt)
+        started = time.time()
+        ok, resposta, detail = _answer(mensagem, telefone=telefone, nome=nome)
+        detail = f"{detail}; elapsed={time.time() - started:.1f}s"
 
         if self.path == "/v1/chat/completions":
             _json_response(
@@ -329,7 +388,7 @@ class Handler(BaseHTTPRequestHandler):
                     "id": "hermes-http-bridge",
                     "object": "chat.completion",
                     "created": int(time.time()),
-                    "model": "hermes-cli",
+                    "model": f"hermes-http-bridge/{ENGINE}",
                     "choices": [
                         {
                             "index": 0,
@@ -348,13 +407,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     if not AUTH_KEY:
-        print(
-            "[hermes-http-bridge] refusing to start: set HERMES_HTTP_BRIDGE_KEY or API_SERVER_KEY",
-            file=sys.stderr,
-            flush=True,
-        )
+        print("[hermes-http-bridge] refusing to start: set HERMES_HTTP_BRIDGE_KEY", file=sys.stderr, flush=True)
         return 2
-    print(f"[hermes-http-bridge] listening on {HOST}:{PORT}", flush=True)
+    print(f"[hermes-http-bridge] listening on {HOST}:{PORT} engine={ENGINE}", flush=True)
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.serve_forever()
     return 0
