@@ -41,7 +41,7 @@ class PatchConfigTests(unittest.TestCase):
         config = {
             "model": {
                 "provider": "custom",
-                "default": "gpt-4o-mini",
+                "default": "gpt-5-mini",
                 "base_url": "https://api.openai.com/v1",
                 "api_key": "${OPENAI_API_KEY}",
             }

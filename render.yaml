@@ -73,7 +73,7 @@ services:
       # upstream OpenAI provider setting into the custom OpenAI-compatible
       # provider format. You can change this later in the Render Environment.
       - key: ALUMINIO_JR_OPENAI_MODEL
-        value: "gpt-4o-mini"
+        value: "gpt-5-mini"
 
       # Set to "0" if you do not want the boot patcher to repair OpenAI model
       # config or append the Alumínio JR rules to SOUL.md.

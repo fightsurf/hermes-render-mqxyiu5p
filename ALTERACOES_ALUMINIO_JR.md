@@ -6,7 +6,7 @@ Arquivos alterados/adicionados:
   - Corrige `provider: openai` e `provider: openai-api` para `provider: custom`.
   - Configura `base_url: https://api.openai.com/v1`.
   - Usa `key_env: OPENAI_API_KEY` para o Hermes buscar a chave no Environment da Render.
-  - Usa modelo padrão `gpt-4o-mini`, ou o valor de `ALUMINIO_JR_OPENAI_MODEL`.
+  - Usa modelo padrão `gpt-5-mini`, ou o valor de `ALUMINIO_JR_OPENAI_MODEL`.
   - Remove a forma antiga `api_key: ${OPENAI_API_KEY}` quando ela existir no `config.yaml`.
   - Adiciona regras da Alumínio JR em `/opt/data/SOUL.md` uma única vez.
 
@@ -17,7 +17,7 @@ Arquivos alterados/adicionados:
 
 - `render.yaml`
   - Adiciona `OPENAI_API_KEY` como variável `sync: false`.
-  - Adiciona `ALUMINIO_JR_OPENAI_MODEL=gpt-4o-mini`.
+  - Adiciona `ALUMINIO_JR_OPENAI_MODEL=gpt-5-mini`.
   - Habilita o bootstrap de OpenAI e SOUL.md.
 
 - `.env.example`
@@ -31,7 +31,7 @@ Arquivos alterados/adicionados:
 1. Substitua/envie estes arquivos no repositório GitHub do Hermes.
 2. Na Render, confirme em `Environment`:
    - `OPENAI_API_KEY` preenchida com sua chave OpenAI API.
-   - `ALUMINIO_JR_OPENAI_MODEL=gpt-4o-mini`.
+   - `ALUMINIO_JR_OPENAI_MODEL=gpt-5-mini`.
 3. Faça deploy/restart do serviço Hermes.
 4. Não entre em `MODELS` antes do primeiro teste.
 5. Teste em `CHAT`:
@@ -59,7 +59,7 @@ Após o deploy/restart, o início de `/opt/data/config.yaml` deve ficar assim:
 ```yaml
 model:
   provider: custom
-  default: gpt-4o-mini
+  default: gpt-5-mini
   base_url: https://api.openai.com/v1
   key_env: OPENAI_API_KEY
 providers: {}

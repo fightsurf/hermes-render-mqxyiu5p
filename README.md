@@ -19,7 +19,7 @@ Este fork/patch usa a OpenAI direta por meio do provider `custom` do Hermes:
 ```yaml
 model:
   provider: custom
-  default: gpt-4o-mini
+  default: gpt-5-mini
   base_url: https://api.openai.com/v1
   key_env: OPENAI_API_KEY
 ```
@@ -30,7 +30,7 @@ Configuração esperada em Render → Environment:
 
 ```text
 OPENAI_API_KEY=<sua chave OpenAI completa>
-ALUMINIO_JR_OPENAI_MODEL=gpt-4o-mini
+ALUMINIO_JR_OPENAI_MODEL=gpt-5-mini
 ALUMINIO_JR_ENABLE_OPENAI_BOOTSTRAP=1
 ALUMINIO_JR_ENABLE_SOUL_BOOTSTRAP=1
 ALUMINIO_JR_SYNC_OPENAI_ENV_TO_DISK=1
@@ -398,7 +398,7 @@ This fork includes a small bootstrap for the Alumínio JR test deployment.
 
 - Repairs the known-bad Hermes model config values `provider: openai` and `provider: openai-api` into the OpenAI-compatible `custom` provider format.
 - Uses `https://api.openai.com/v1` with `key_env: OPENAI_API_KEY`.
-- Defaults to `gpt-4o-mini`, controlled by `ALUMINIO_JR_OPENAI_MODEL`.
+- Defaults to `gpt-5-mini`, controlled by `ALUMINIO_JR_OPENAI_MODEL`.
 - Appends primary customer-service rules to `/opt/data/SOUL.md` once.
 - Adds the `aluminio-jr-atendimento` skill for WhatsApp/customer-service triage.
 
@@ -413,7 +413,7 @@ OPENAI_API_KEY=<sua chave completa da OpenAI API>
 Optional:
 
 ```text
-ALUMINIO_JR_OPENAI_MODEL=gpt-4o-mini
+ALUMINIO_JR_OPENAI_MODEL=gpt-5-mini
 ALUMINIO_JR_ENABLE_OPENAI_BOOTSTRAP=1
 ALUMINIO_JR_ENABLE_SOUL_BOOTSTRAP=1
 ```
@@ -425,7 +425,7 @@ Expected model block after boot:
 ```yaml
 model:
   provider: custom
-  default: gpt-4o-mini
+  default: gpt-5-mini
   base_url: https://api.openai.com/v1
   key_env: OPENAI_API_KEY
 ```
