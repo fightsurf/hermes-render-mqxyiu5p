@@ -14,6 +14,8 @@ Authentication: Authorization: Bearer <HERMES_HTTP_BRIDGE_KEY>
 Default engine is "direct": deterministic replies + Alumínio JR product API +
 OpenAI fallback. Product queries now also return structured product cards so
 n8n can send the same image+caption format used by the @preco flow.
+It also keeps a short per-phone product context so follow-up messages such as
+"e a de meio litro?" continue the previous product conversation.
 """
 from __future__ import annotations
 
@@ -63,6 +65,12 @@ STOPWORDS_BUSCA = {
     "quanto", "custa", "custo", "valor", "preco", "preco", "preço", "tem", "qual", "quais", "me", "diga",
     "quero", "queria", "preciso", "comprar", "manda", "mande", "orcamento", "orçamento", "produto", "produtos",
 }
+
+# Memória curta em RAM, suficiente para conversas naturais no WhatsApp.
+# Perde ao reiniciar o Render, o que é aceitável para este ciclo.
+CONVERSAS: dict[str, dict[str, Any]] = {}
+CONVERSA_TTL_SECONDS = int(os.environ.get("HERMES_CONVERSA_TTL_SECONDS", "1800"))
+
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, data: dict[str, Any]) -> None:
@@ -145,13 +153,188 @@ def _is_product_question(texto: str) -> bool:
     return bool(PRODUTO_RE.search(texto or ""))
 
 
+def _telefone_key(telefone: str) -> str:
+    raw = str(telefone or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    return digits or raw
+
+
+def _get_contexto(telefone: str) -> dict[str, Any] | None:
+    key = _telefone_key(telefone)
+    if not key:
+        return None
+    ctx = CONVERSAS.get(key)
+    if not ctx:
+        return None
+    if time.time() - float(ctx.get("ts", 0)) > CONVERSA_TTL_SECONDS:
+        CONVERSAS.pop(key, None)
+        return None
+    return ctx
+
+
+def _texto_tipo(tipo: str | None) -> str:
+    if tipo == "panela_pressao":
+        return "panela de pressão"
+    if tipo == "cafeteira":
+        return "cafeteira"
+    if tipo == "jogo_panela":
+        return "jogo de panela"
+    return ""
+
+
+def _texto_capacidade(cap: str) -> str:
+    cap = str(cap or "").replace(",", ".")
+    if cap == "0.5":
+        return "0,5L"
+    if cap == "1.5":
+        return "1,5L"
+    return f"{cap.replace('.', ',')}L"
+
+
+def _is_product_followup(texto: str, telefone: str) -> bool:
+    ctx = _get_contexto(telefone)
+    if not ctx or ctx.get("tipo") != "produto":
+        return False
+    n = _norm(texto)
+    if not n:
+        return False
+    if _is_product_question(texto):
+        return True
+    # Frases curtas de continuação: "e a de meio litro?", "tem com caixa?", "a preta?".
+    gatilhos = [
+        "e a", "e o", "essa", "esse", "aquela", "aquele", "maior", "menor",
+        "meio litro", "litro", "ml", "com caixa", "sem caixa", "c caixa", "s caixa",
+        "preta", "preto", "polida", "polido", "craqueada", "craq", "vermelha", "vermelho",
+    ]
+    return len(n) <= 80 and any(g in n for g in gatilhos)
+
+
+def _resolver_contexto_produto(texto: str, telefone: str) -> str:
+    ctx = _get_contexto(telefone)
+    if not ctx or ctx.get("tipo") != "produto":
+        return texto
+
+    attrs_novos = _atributos_pergunta(texto)
+    attrs_antigos = ctx.get("attrs") if isinstance(ctx.get("attrs"), dict) else {}
+
+    partes: list[str] = []
+    tipo = attrs_novos.get("tipo") or attrs_antigos.get("tipo")
+    tipo_txt = _texto_tipo(tipo)
+    if tipo_txt:
+        partes.append(tipo_txt)
+
+    # Mantém tamanho/cor/caixa anteriores apenas quando a nova frase não troca esse atributo.
+    if not attrs_novos.get("capacidades"):
+        for cap in attrs_antigos.get("capacidades") or []:
+            partes.append(_texto_capacidade(str(cap)))
+    if not attrs_novos.get("cores"):
+        for cor in attrs_antigos.get("cores") or []:
+            partes.append(str(cor))
+    if not attrs_novos.get("com_caixa") and not attrs_novos.get("sem_caixa"):
+        if attrs_antigos.get("com_caixa"):
+            partes.append("com caixa")
+        elif attrs_antigos.get("sem_caixa"):
+            partes.append("sem caixa")
+
+    prefixo = " ".join(dict.fromkeys([p for p in partes if p]))
+    if not prefixo:
+        return texto
+    return f"{prefixo} {texto}".strip()
+
+
+def _salvar_contexto_produto(telefone: str, texto_resolvido: str, attrs: dict[str, Any], produtos: list[dict[str, Any]]) -> None:
+    key = _telefone_key(telefone)
+    if not key:
+        return
+    CONVERSAS[key] = {
+        "tipo": "produto",
+        "ts": time.time(),
+        "texto": texto_resolvido,
+        "attrs": attrs,
+        "produtos": [
+            {"nome": p.get("nome"), "precoFormatado": p.get("precoFormatado")}
+            for p in produtos[:5]
+            if isinstance(p, dict)
+        ],
+    }
+
+
 def _preparar_termo_produto(texto: str) -> str:
+    attrs = _atributos_pergunta(texto)
+
+    # Para perguntas específicas, consulta a API de forma mais ampla e filtra localmente.
+    # Ex.: "cafeteira de meio litro" vira termo "cafeteira", porque o cadastro pode estar como 0,5L/500ml.
+    partes: list[str] = []
+    tipo_txt = _texto_tipo(attrs.get("tipo"))
+    if tipo_txt:
+        partes.append(tipo_txt)
+    for cor in attrs.get("cores") or []:
+        if cor not in partes:
+            partes.append(str(cor))
+    if attrs.get("com_caixa") or attrs.get("sem_caixa"):
+        partes.append("caixa")
+    if partes:
+        return " ".join(partes)[:300]
+
     normal = _norm(texto)
-    tokens = [t for t in normal.split() if t and t not in STOPWORDS_BUSCA]
-    # Mantém a frase original curta quando sobrar pouco token.
+    stop_extra = {"meio", "meia", "litro", "litros", "lt", "lts", "ml", "mililitro", "mililitros"}
+    tokens = [
+        t for t in normal.split()
+        if t and t not in STOPWORDS_BUSCA and t not in stop_extra
+    ]
     if not tokens:
         return (texto or "").strip()[:300]
     return " ".join(tokens)[:300]
+
+
+def _extrair_capacidades(texto: str) -> list[str]:
+    original = str(texto or "").lower()
+    n = _norm(texto)
+    caps: list[str] = []
+
+    def add(cap: float | str) -> None:
+        if isinstance(cap, float):
+            txt = (f"{cap:.2f}" if cap % 1 else f"{cap:.0f}").rstrip("0").rstrip(".")
+        else:
+            txt = str(cap).replace(",", ".")
+        if txt and txt not in caps:
+            caps.append(txt)
+
+    if re.search(r"\b(meio\s+litro|meia\s+litro|meio\s*l)\b", n) or re.search(r"\b1\s*/\s*2\s*l?\b", original):
+        add(0.5)
+    if re.search(r"\b(um|1)\s+litro\s+e\s+meio\b", n):
+        add(1.5)
+    if re.search(r"\b(dois|2)\s+litros?\s+e\s+meio\b", n):
+        add(2.5)
+
+    # 500 ml, 750ml, 1000 ml etc.
+    for m in re.finditer(r"\b(\d{2,4})\s*(ml|mililitros?|mili)\b", n):
+        try:
+            ml = int(m.group(1))
+            if 100 <= ml <= 10000:
+                add(ml / 1000)
+        except Exception:
+            pass
+
+    # 0,5L / 4.5 litros / 1 litro.
+    for m in re.finditer(r"\b(\d{1,2})(?:[,.](\d{1,2}))?\s*(l|lt|lts|litro|litros)\b", n):
+        if m.group(2):
+            dec = m.group(2)
+            add(f"{int(m.group(1))}.{dec}")
+        else:
+            add(str(int(m.group(1))))
+
+    # "4.5" costuma ser litragem em panela de pressão/cafeteira. Evita pegar quantidade solta.
+    for m in re.finditer(r"\b(\d{1,2})[,.](\d{1,2})\b", n):
+        add(f"{int(m.group(1))}.{m.group(2)}")
+
+    # Normalização comum quando texto veio como "4 5l".
+    if re.search(r"\b4\s+5\s*l?\b", n):
+        add("4.5")
+    if re.search(r"\b0\s+5\s*l?\b", n):
+        add("0.5")
+
+    return caps
 
 
 def _atributos_pergunta(texto: str) -> dict[str, Any]:
@@ -162,7 +345,7 @@ def _atributos_pergunta(texto: str) -> dict[str, Any]:
     tipo = None
     if "panela" in n and ("pressao" in n or "pressa" in n):
         tipo = "panela_pressao"
-    elif "cafeteira" in n:
+    elif "cafeteira" in n or "cafeiteira" in n:
         tipo = "cafeteira"
     elif "jogo" in n and "panela" in n:
         tipo = "jogo_panela"
@@ -172,18 +355,7 @@ def _atributos_pergunta(texto: str) -> dict[str, Any]:
         if re.search(rf"\b{cor}\b", n):
             cores.append(cor)
 
-    capacidades: list[str] = []
-    # Captura capacidades com decimal ou com L/litro explícito. Evita quantidade solta como "10 panelas".
-    for m in re.finditer(r"\b(\d{1,2})(?:[,.](\d))?\s*(l|lt|litro|litros)\b", n):
-        if m.group(2):
-            capacidades.append(f"{int(m.group(1))}.{m.group(2)}")
-        else:
-            capacidades.append(str(int(m.group(1))))
-    for m in re.finditer(r"\b(\d{1,2})[,.](\d)\b", n):
-        capacidades.append(f"{int(m.group(1))}.{m.group(2)}")
-    # Padrão comum: "pressao 45" ou "4 5" pode aparecer já normalizado de 4.5.
-    if re.search(r"\b4\s+5\b", n) and "4.5" not in capacidades:
-        capacidades.append("4.5")
+    capacidades = _extrair_capacidades(texto)
 
     return {
         "norm": n,
@@ -194,20 +366,73 @@ def _atributos_pergunta(texto: str) -> dict[str, Any]:
         "capacidades": list(dict.fromkeys(capacidades)),
     }
 
-
 def _produto_tem_capacidade(nome_norm: str, capacidade: str) -> bool:
-    cap = capacidade.replace(",", ".")
+    cap = str(capacidade or "").replace(",", ".")
+    if not cap:
+        return False
+
+    # 0,5L / meio litro / 500ml / 1/2L.
+    if cap in {"0.5", "0.50"}:
+        patterns = [
+            r"\b0[,. ]?5\s*l\b",
+            r"\b0[,. ]?5\b",
+            r"\b500\s*ml\b",
+            r"\bmeio\s+litro\b",
+            r"\b1\s+2\s*l\b",
+            r"\b1\s+2\b",
+        ]
+        return any(re.search(pat, nome_norm) for pat in patterns)
+
+    # Conversão inversa: 1L pode estar como 1000ml.
+    try:
+        cap_float = float(cap)
+        ml = int(round(cap_float * 1000))
+        ml_pattern = rf"\b{ml}\s*ml\b"
+    except Exception:
+        ml_pattern = r"$a"  # nunca casa
+
     if "." in cap:
         inteiro, dec = cap.split(".", 1)
+        dec = dec.rstrip("0") or "0"
         patterns = [
             rf"\b{re.escape(inteiro)}[,. ]?{re.escape(dec)}\s*l\b",
             rf"\b{re.escape(inteiro)}\s+{re.escape(dec)}\s*l\b",
             rf"\b{re.escape(inteiro)}[,. ]?{re.escape(dec)}\b",
+            ml_pattern,
         ]
     else:
-        patterns = [rf"\b{re.escape(cap)}\s*l\b", rf"\b{re.escape(cap)}\b"]
+        patterns = [rf"\b{re.escape(cap)}\s*l\b", rf"\b{re.escape(cap)}\s+litro", ml_pattern]
     return any(re.search(pat, nome_norm) for pat in patterns)
 
+
+def _produto_match_tipo(produto: dict[str, Any], tipo: str | None) -> bool:
+    if not tipo:
+        return True
+    nome_norm = _norm(f"{produto.get('nome') or ''} {produto.get('categoria') or ''}")
+    if tipo == "panela_pressao":
+        return "panela" in nome_norm and "pressao" in nome_norm
+    if tipo == "cafeteira":
+        return "cafeteira" in nome_norm or "cafeiteira" in nome_norm
+    if tipo == "jogo_panela":
+        return "jogo" in nome_norm and "panela" in nome_norm
+    return True
+
+
+def _produto_match_caixa(produto: dict[str, Any], attrs: dict[str, Any]) -> bool:
+    nome_norm = _norm(f"{produto.get('nome') or ''} {produto.get('categoria') or ''}")
+    if attrs.get("com_caixa"):
+        return bool(re.search(r"\bc caixa\b", nome_norm) or re.search(r"\bcom caixa\b", nome_norm))
+    if attrs.get("sem_caixa"):
+        return bool(re.search(r"\bs caixa\b", nome_norm) or re.search(r"\bsem caixa\b", nome_norm))
+    return True
+
+
+def _produto_match_capacidades(produto: dict[str, Any], attrs: dict[str, Any]) -> bool:
+    caps = attrs.get("capacidades") or []
+    if not caps:
+        return True
+    nome_norm = _norm(f"{produto.get('nome') or ''} {produto.get('categoria') or ''}")
+    return all(_produto_tem_capacidade(nome_norm, str(cap)) for cap in caps)
 
 def _score_produto(produto: dict[str, Any], attrs: dict[str, Any], posicao_api: int) -> int:
     nome = str(produto.get("nome") or "")
@@ -291,29 +516,42 @@ def _preparar_produtos_whatsapp(produtos: list[dict[str, Any]]) -> list[dict[str
     return cards
 
 
-def _selecionar_produtos(texto: str, produtos_api: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+def _selecionar_produtos(texto: str, produtos_api: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
     attrs = _atributos_pergunta(texto)
+    candidatos = [p for p in produtos_api if isinstance(p, dict)]
+
+    # Filtros duros quando o cliente foi específico. Isso evita mandar todas as cafeteiras
+    # quando ele pediu "cafeteira de meio litro".
+    for filtro in [
+        lambda p: _produto_match_tipo(p, attrs.get("tipo")),
+        lambda p: _produto_match_capacidades(p, attrs),
+        lambda p: _produto_match_caixa(p, attrs),
+    ]:
+        filtrados = [p for p in candidatos if filtro(p)]
+        if filtrados:
+            candidatos = filtrados
+
     scored = []
-    for idx, produto in enumerate(produtos_api):
-        if not isinstance(produto, dict):
-            continue
+    for idx, produto in enumerate(candidatos):
         scored.append((_score_produto(produto, attrs, idx), idx, produto))
     scored.sort(key=lambda x: (-x[0], x[1]))
     if not scored:
-        return [], False
+        return [], False, attrs
 
     top_score = scored[0][0]
     second_score = scored[1][0] if len(scored) > 1 else -9999
     strong_attrs = bool(attrs.get("tipo") or attrs.get("com_caixa") or attrs.get("sem_caixa") or attrs.get("capacidades") or attrs.get("cores"))
 
+    # Quando o cliente especificou tamanho/caixa/cor e o filtro reduziu bem, não mande o catálogo inteiro.
+    if strong_attrs and len(scored) <= MAX_PRODUCT_CARDS:
+        return [p for _score, _idx, p in scored], len(scored) == 1, attrs
+
     # Se os atributos deixam um vencedor claro, responda direto com 1 produto.
     if strong_attrs and top_score >= 350 and (top_score - second_score >= 120 or len(scored) == 1):
-        return [scored[0][2]], True
+        return [scored[0][2]], True, attrs
 
-    # Caso contrário, mostre opções, mas já reordenadas pelos atributos.
     selected = [p for _score, _idx, p in scored[:MAX_PRODUCT_CARDS]]
-    return selected, False
-
+    return selected, False, attrs
 
 def _montar_resposta_produtos(produtos: list[dict[str, Any]], total_encontrados: int, quantidade: int | None, unico: bool) -> str:
     if not produtos:
@@ -340,7 +578,7 @@ def _montar_resposta_produtos(produtos: list[dict[str, Any]], total_encontrados:
     return "Encontrei essas opções: " + "; ".join(linhas) + ". Qual dessas?"
 
 
-def _product_api(texto: str) -> tuple[bool, str, str, dict[str, Any]]:
+def _product_api(texto: str, telefone: str = "") -> tuple[bool, str, str, dict[str, Any]]:
     if not ALUMINIO_BASE_URL or not ASSISTENTE_API_TOKEN:
         return False, FALLBACK_TEXT, "product api env missing", {}
 
@@ -374,10 +612,12 @@ def _product_api(texto: str) -> tuple[bool, str, str, dict[str, Any]]:
     if not isinstance(produtos_api, list):
         produtos_api = []
 
-    produtos, unico = _selecionar_produtos(texto, produtos_api)
+    produtos, unico, attrs = _selecionar_produtos(texto, produtos_api)
     total_encontrados = int(data.get("encontrados") or len(produtos_api) or len(produtos)) if isinstance(data, dict) else len(produtos)
     resposta = _montar_resposta_produtos(produtos, total_encontrados, qtd, unico)
     cards = _preparar_produtos_whatsapp(produtos)
+    if produtos:
+        _salvar_contexto_produto(telefone, texto, attrs, produtos)
 
     extra = {
         "tipoResposta": "produtos" if cards else "texto",
@@ -385,6 +625,7 @@ def _product_api(texto: str) -> tuple[bool, str, str, dict[str, Any]]:
         "termoProduto": termo_produto,
         "totalEncontrados": total_encontrados,
         "produtoUnico": bool(unico or len(produtos) == 1),
+        "atributosDetectados": attrs,
         "produtos": cards,
     }
     return bool(produtos), resposta, "product api structured", extra
@@ -544,8 +785,9 @@ def _answer(texto: str, telefone: str = "", nome: str = "") -> tuple[bool, str, 
         if regex.match(texto):
             return True, resposta, "direct greeting", {"tipoResposta": "texto"}
 
-    if _is_product_question(texto):
-        return _product_api(texto)
+    if _is_product_question(texto) or _is_product_followup(texto, telefone):
+        texto_produto = _resolver_contexto_produto(texto, telefone)
+        return _product_api(texto_produto, telefone=telefone)
 
     ok, resposta, detail, extra = _openai_call(texto, telefone, nome)
     extra.setdefault("tipoResposta", "texto")
@@ -553,7 +795,7 @@ def _answer(texto: str, telefone: str = "", nome: str = "") -> tuple[bool, str, 
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "HermesHTTPBridge/2.1"
+    server_version = "HermesHTTPBridge/2.2"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[hermes-http-bridge] {self.address_string()} - {fmt % args}", flush=True)
@@ -564,7 +806,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path in {"/", "/healthz", "/api/status"}:
-            _json_response(self, 200, {"ok": True, "service": "hermes-http-bridge", "engine": ENGINE, "version": "2.1"})
+            _json_response(self, 200, {"ok": True, "service": "hermes-http-bridge", "engine": ENGINE, "version": "2.2"})
             return
         _json_response(self, 404, {"ok": False, "error": "not found"})
 
@@ -622,7 +864,7 @@ def main() -> int:
     if not AUTH_KEY:
         print("[hermes-http-bridge] refusing to start: set HERMES_HTTP_BRIDGE_KEY", file=sys.stderr, flush=True)
         return 2
-    print(f"[hermes-http-bridge] listening on {HOST}:{PORT} engine={ENGINE} version=2.1", flush=True)
+    print(f"[hermes-http-bridge] listening on {HOST}:{PORT} engine={ENGINE} version=2.2", flush=True)
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.serve_forever()
     return 0
