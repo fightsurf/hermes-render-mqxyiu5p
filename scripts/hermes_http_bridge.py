@@ -427,12 +427,30 @@ def _produto_match_caixa(produto: dict[str, Any], attrs: dict[str, Any]) -> bool
     return True
 
 
+def _produto_match_cores(produto: dict[str, Any], attrs: dict[str, Any]) -> bool:
+    cores = attrs.get("cores") or []
+    if not cores:
+        return True
+    nome_norm = _norm(f"{produto.get('nome') or ''} {produto.get('categoria') or ''}")
+    for cor in cores:
+        if cor in {"preto", "preta"}:
+            if "preta" in nome_norm or "preto" in nome_norm:
+                return True
+        elif cor in {"craqueada", "craq"}:
+            if "craq" in nome_norm or "craqueada" in nome_norm:
+                return True
+        elif str(cor) in nome_norm:
+            return True
+    return False
+
+
 def _produto_match_capacidades(produto: dict[str, Any], attrs: dict[str, Any]) -> bool:
     caps = attrs.get("capacidades") or []
     if not caps:
         return True
     nome_norm = _norm(f"{produto.get('nome') or ''} {produto.get('categoria') or ''}")
     return all(_produto_tem_capacidade(nome_norm, str(cap)) for cap in caps)
+
 
 def _score_produto(produto: dict[str, Any], attrs: dict[str, Any], posicao_api: int) -> int:
     nome = str(produto.get("nome") or "")
@@ -516,27 +534,99 @@ def _preparar_produtos_whatsapp(produtos: list[dict[str, Any]]) -> list[dict[str
     return cards
 
 
+def _descricao_solicitacao(attrs: dict[str, Any]) -> str:
+    partes: list[str] = []
+    tipo_txt = _texto_tipo(attrs.get("tipo"))
+    if tipo_txt:
+        partes.append(tipo_txt)
+    for cap in attrs.get("capacidades") or []:
+        partes.append(_texto_capacidade(str(cap)))
+    for cor in attrs.get("cores") or []:
+        cor_txt = str(cor)
+        if cor_txt == "preto":
+            cor_txt = "preta"
+        elif cor_txt == "polido":
+            cor_txt = "polida"
+        elif cor_txt == "vermelho":
+            cor_txt = "vermelha"
+        if cor_txt not in partes:
+            partes.append(cor_txt)
+    if attrs.get("com_caixa"):
+        partes.append("com caixa")
+    elif attrs.get("sem_caixa"):
+        partes.append("sem caixa")
+    return " ".join(partes).strip() or "esse produto"
+
+
+def _attrs_para_score(attrs: dict[str, Any], filtros_faltantes: list[str]) -> dict[str, Any]:
+    score_attrs = dict(attrs)
+    if "tipo" in filtros_faltantes:
+        score_attrs["tipo"] = None
+    if "capacidade" in filtros_faltantes:
+        score_attrs["capacidades"] = []
+    if "caixa" in filtros_faltantes:
+        score_attrs["com_caixa"] = False
+        score_attrs["sem_caixa"] = False
+    if "cor" in filtros_faltantes:
+        score_attrs["cores"] = []
+    return score_attrs
+
+
 def _selecionar_produtos(texto: str, produtos_api: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
     attrs = _atributos_pergunta(texto)
     candidatos = [p for p in produtos_api if isinstance(p, dict)]
+    filtros_faltantes: list[str] = []
 
-    # Filtros duros quando o cliente foi específico. Isso evita mandar todas as cafeteiras
-    # quando ele pediu "cafeteira de meio litro".
-    for filtro in [
-        lambda p: _produto_match_tipo(p, attrs.get("tipo")),
-        lambda p: _produto_match_capacidades(p, attrs),
-        lambda p: _produto_match_caixa(p, attrs),
-    ]:
-        filtrados = [p for p in candidatos if filtro(p)]
+    # Filtro de tipo é a base da conversa. Se o cliente pede cafeteira 3L e não existe 3L,
+    # ainda queremos oferecer apenas outras cafeteiras, não o catálogo inteiro.
+    if attrs.get("tipo"):
+        filtrados_tipo = [p for p in candidatos if _produto_match_tipo(p, attrs.get("tipo"))]
+        if filtrados_tipo:
+            candidatos = filtrados_tipo
+        else:
+            filtros_faltantes.append("tipo")
+
+    # Filtros específicos. Quando um deles não tem correspondência, guardamos o fato
+    # e mantemos as alternativas já filtradas até ali para responder como atendente:
+    # "não temos esse modelo, vou mandar as opções que temos".
+    if attrs.get("capacidades"):
+        filtrados = [p for p in candidatos if _produto_match_capacidades(p, attrs)]
         if filtrados:
             candidatos = filtrados
+        else:
+            filtros_faltantes.append("capacidade")
 
+    if attrs.get("com_caixa") or attrs.get("sem_caixa"):
+        filtrados = [p for p in candidatos if _produto_match_caixa(p, attrs)]
+        if filtrados:
+            candidatos = filtrados
+        else:
+            filtros_faltantes.append("caixa")
+
+    if attrs.get("cores"):
+        filtrados = [p for p in candidatos if _produto_match_cores(p, attrs)]
+        if filtrados:
+            candidatos = filtrados
+        else:
+            filtros_faltantes.append("cor")
+
+    filtros_faltantes = list(dict.fromkeys(filtros_faltantes))
+    attrs["match_exato"] = len(filtros_faltantes) == 0
+    attrs["filtros_faltantes"] = filtros_faltantes
+    attrs["descricao_solicitada"] = _descricao_solicitacao(attrs)
+
+    score_attrs = _attrs_para_score(attrs, filtros_faltantes)
     scored = []
     for idx, produto in enumerate(candidatos):
-        scored.append((_score_produto(produto, attrs, idx), idx, produto))
+        scored.append((_score_produto(produto, score_attrs, idx), idx, produto))
     scored.sort(key=lambda x: (-x[0], x[1]))
     if not scored:
         return [], False, attrs
+
+    # Se faltou algum atributo específico, devolve alternativas próximas, nunca como se fosse match exato.
+    if filtros_faltantes:
+        selected = [p for _score, _idx, p in scored[:MAX_PRODUCT_CARDS]]
+        return selected, False, attrs
 
     top_score = scored[0][0]
     second_score = scored[1][0] if len(scored) > 1 else -9999
@@ -553,9 +643,34 @@ def _selecionar_produtos(texto: str, produtos_api: list[dict[str, Any]]) -> tupl
     selected = [p for _score, _idx, p in scored[:MAX_PRODUCT_CARDS]]
     return selected, False, attrs
 
-def _montar_resposta_produtos(produtos: list[dict[str, Any]], total_encontrados: int, quantidade: int | None, unico: bool) -> str:
+
+def _montar_resposta_produtos(
+    produtos: list[dict[str, Any]],
+    total_encontrados: int,
+    quantidade: int | None,
+    unico: bool,
+    attrs: dict[str, Any] | None = None,
+) -> str:
+    attrs = attrs or {}
     if not produtos:
+        solicitado = attrs.get("descricao_solicitada") or "esse produto"
+        if attrs.get("tipo") or attrs.get("capacidades") or attrs.get("cores") or attrs.get("com_caixa") or attrs.get("sem_caixa"):
+            return f"Não encontrei {solicitado} no catálogo."
         return "Não encontrei esse produto. Me diga o modelo ou tamanho."
+
+    if attrs.get("match_exato") is False:
+        solicitado = attrs.get("descricao_solicitada") or "esse modelo"
+        tipo_txt = _texto_tipo(attrs.get("tipo")) or "produto"
+        faltantes = set(attrs.get("filtros_faltantes") or [])
+        if "capacidade" in faltantes:
+            inicio = f"Não temos {solicitado} no catálogo."
+        elif "caixa" in faltantes:
+            inicio = f"Não encontrei {solicitado} no catálogo."
+        elif "cor" in faltantes:
+            inicio = f"Não encontrei {solicitado} no catálogo."
+        else:
+            inicio = f"Não encontrei exatamente {solicitado} no catálogo."
+        return f"{inicio} Vou te mandar as opções de {tipo_txt} que temos."
 
     if unico or len(produtos) == 1:
         produto = produtos[0]
@@ -614,17 +729,25 @@ def _product_api(texto: str, telefone: str = "") -> tuple[bool, str, str, dict[s
 
     produtos, unico, attrs = _selecionar_produtos(texto, produtos_api)
     total_encontrados = int(data.get("encontrados") or len(produtos_api) or len(produtos)) if isinstance(data, dict) else len(produtos)
-    resposta = _montar_resposta_produtos(produtos, total_encontrados, qtd, unico)
+    resposta = _montar_resposta_produtos(produtos, total_encontrados, qtd, unico, attrs)
     cards = _preparar_produtos_whatsapp(produtos)
     if produtos:
         _salvar_contexto_produto(telefone, texto, attrs, produtos)
 
+    # Quando o cliente pediu um modelo específico inexistente, o n8n deve enviar primeiro
+    # uma frase natural de atendimento e depois as imagens das alternativas disponíveis.
+    enviar_texto_antes_produtos = bool(cards and attrs.get("match_exato") is False and resposta)
+
     extra = {
         "tipoResposta": "produtos" if cards else "texto",
         "enviarComoImagem": bool(cards),
+        "enviarTextoAntesProdutos": enviar_texto_antes_produtos,
+        "textoAntesProdutos": resposta if enviar_texto_antes_produtos else "",
         "termoProduto": termo_produto,
         "totalEncontrados": total_encontrados,
-        "produtoUnico": bool(unico or len(produtos) == 1),
+        "produtoUnico": bool((unico or len(produtos) == 1) and attrs.get("match_exato") is not False),
+        "matchExatoProduto": attrs.get("match_exato") is not False,
+        "filtrosFaltantes": attrs.get("filtros_faltantes") or [],
         "atributosDetectados": attrs,
         "produtos": cards,
     }
